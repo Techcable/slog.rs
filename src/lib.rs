@@ -306,7 +306,6 @@ extern crate erased_serde;
 extern crate serde;
 
 use core::str::FromStr;
-use core::time::Duration;
 use core::{convert, fmt, result};
 #[cfg(feature = "std")]
 use std::borrow::{Cow, ToOwned};
@@ -1324,15 +1323,84 @@ where
         self.drain.log(record, &chained)
     }
 
-    /// Flush the underlying drain. See the the underlying `Drain`s implementation for further
-    /// information.
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        self.drain.flush(interval)
+    /// Flush the underlying drain.
+    ///
+    /// See [`Drain::flush`] for more information.
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        self.drain.flush(request)
     }
 
     #[inline]
     fn is_enabled(&self, level: Level) -> bool {
         self.drain.is_enabled(level)
+    }
+}
+
+/// Controls how [`Drain::flush`] is executed
+#[derive(Debug, Clone, Default)]
+pub enum FlushRequest {
+    /// Block until the flush is completed.
+    ///
+    /// This is the default behavior
+    #[default]
+    Blocking,
+    /// Require the flush to be performed asychronously,
+    /// returning a [`Future`] pending completion.
+    ///
+    /// If a drain doesn't support asynchronous flushing,
+    /// this request will return an error [`std::io::ErrorKind::WouldBlock`].
+    RequireAsync,
+    /// Attempt to perform a flush asynchronously,
+    /// falling back to blocking behavior if unsupported.
+    MaybeAsync,
+}
+
+/// A [`Future`][`std::future::Future`] associated with a pending [`FlushRequest`]
+///
+/// Returned by [`Drain::flush`] via [`FlushStatus::Future`]
+pub type FlushFuture = Box<dyn std::future::Future<Output = io::Result<()>>>;
+
+/// The result of a [`Drain::flush`] operation.
+#[must_use]
+pub enum FlushStatus {
+    /// Indicates that a flush is being performed asynchronously.
+    ///
+    /// The specified [`FlushFuture`] can be used to check for the result.
+    Future(FlushFuture),
+    /// Indicates the flush was completed succesfully.
+    ///
+    /// This is a response to [`FlushRequest::Blocking`],
+    /// and is never returned for asynchronous requests (even if they occur immediately)
+    Success,
+}
+impl FlushStatus {
+    /// Treat this this [`FlushStatus`] as a [`Future`],
+    /// returning immediately if already a [`FlushStatus::Success`]
+    pub async fn future(self) -> io::Result<()> {
+        match self {
+            FlushStatus::Future(future) => Box::into_pin(future).await,
+            FlushStatus::Success => Ok(())
+        }
+    }
+
+    /// Assume the [`FlushRequest`] was performed asynchronously,
+    /// and has an underlying [`FlushFuture`]
+    #[track_caller]
+    pub fn expect_async(self) -> FlushFuture {
+        match self {
+            FlushStatus::Future(future) => future,
+            FlushStatus::Success => panic!("Expected async response (want a Future)"),
+        }
+    }
+
+    /// Assume the [`FlushResult`] was performed synchronously,
+    /// and does not have an underlying [`FlushFuture`].
+    #[track_caller]
+    pub fn expect_synchronous(self) {
+        match self {
+            FlushStatus::Future(_future) => panic!("Expected sync response (got a Future)"),
+            FlushStatus::Success => {},
+        }
     }
 }
 
@@ -1378,12 +1446,21 @@ pub trait Drain {
         values: &OwnedKVList,
     ) -> result::Result<Self::Ok, Self::Err>;
 
-    /// Flush the drain if possible. Certain implementations, e.g. `Async`, provide this method.
-    /// The flush will poll with interval `interval` till all records have been
-    /// processed (what that means is dependent on the actual `Drain`).
-    fn flush(&self, _interval: Duration) -> io::Result<()> {
-        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    /// Flush all pending log records in the drain.
+    ///
+    /// The provided [`FlushRequest`] indicates whether the flush
+    /// should be perfromed synchronously ([`FlushResult::Block`])
+    /// or asynchronously.
+    fn flush(&self, _request: FlushRequest) -> io::Result<FlushStatus> {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Drain {type_name:?} doesn't support flush operations",
+                type_name = std::any::type_name_of_val(self),
+            )
+        ));
     }
+
     /// **Avoid**: Check if messages at the specified log level are **maybe**
     /// enabled for this logger.
     ///
@@ -1732,8 +1809,8 @@ impl<D: Drain + ?Sized> Drain for Box<D> {
         (**self).is_enabled(level)
     }
     #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        (**self).flush(interval)
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        (**self).flush(request)
     }
 }
 
@@ -1752,8 +1829,8 @@ impl<D: Drain + ?Sized> Drain for Arc<D> {
         (**self).is_enabled(level)
     }
     #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        (**self).flush(interval)
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        (**self).flush(request)
     }
 }
 
@@ -1824,10 +1901,9 @@ where
          */
         self.0.is_enabled(level)
     }
-
     #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        self.0.flush(interval)
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        self.0.flush(request)
     }
 }
 
@@ -1868,10 +1944,9 @@ impl<D: Drain> Drain for LevelFilter<D> {
     fn is_enabled(&self, level: Level) -> bool {
         level.is_at_least(self.1) && self.0.is_enabled(level)
     }
-
     #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        self.0.flush(interval)
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        self.0.flush(request)
     }
 }
 
@@ -1914,8 +1989,8 @@ impl<D: Drain, E> Drain for MapError<D, E> {
         self.drain.is_enabled(level)
     }
     #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        self.drain.flush(interval)
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        self.drain.flush(request)
     }
 }
 
@@ -1955,9 +2030,45 @@ impl<D1: Drain, D2: Drain> Drain for Duplicate<D1, D2> {
     fn is_enabled(&self, level: Level) -> bool {
         self.0.is_enabled(level) || self.1.is_enabled(level)
     }
-    #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        self.0.flush(interval)
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        fn combine_responses(
+            first: io::Result<FlushStatus>,
+            second: io::Result<FlushStatus>
+        ) -> io::Result<(FlushStatus, FlushStatus)> {
+            match (first, second) {
+                (Ok(status1), Ok(status2)) => Ok((status1, status2)),
+                /*                                 *
+                 * TODO: If both drains error, return both errors.
+                 * For the time being, we only return the first of the two errors.
+                 */
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        match request {
+            FlushRequest::Blocking => {
+                /*
+                 * Unconditionally request a flush from both drains,
+                 * even if the first one returns an error.
+                 */
+                let (first, second) = combine_responses(
+                    self.0.flush(FlushRequest::Blocking),
+                    self.1.flush(FlushRequest::Blocking),
+                )?;
+                first.expect_synchronous();
+                second.expect_synchronous();
+                Ok(FlushStatus::Success)
+            },
+            FlushRequest::RequireAsync | FlushRequest::MaybeAsync => {
+                let (first, second) = combine_responses(
+                    self.0.flush(request.clone()),
+                    self.1.flush(request.clone()),
+                )?;
+                match (first, second) {
+                    
+                }
+            },
+            FlushRequest::MaybeAsync => todo!("Implement {request:?}")
+        }
     }
 }
 
@@ -2005,8 +2116,8 @@ where
         self.0.is_enabled(level)
     }
     #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        self.0.flush(interval)
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        self.0.flush(request)
     }
 }
 
@@ -2044,8 +2155,8 @@ impl<D: Drain> Drain for IgnoreResult<D> {
         self.drain.is_enabled(level)
     }
     #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
-        self.drain.flush(interval)
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
+        self.drain.flush(request)
     }
 }
 
@@ -2143,10 +2254,10 @@ impl<D: Drain> Drain for std::sync::Mutex<D> {
         self.lock().ok().map_or(true, |lock| lock.is_enabled(level))
     }
     #[inline]
-    fn flush(&self, interval: Duration) -> io::Result<()> {
+    fn flush(&self, request: FlushRequest) -> io::Result<FlushStatus> {
         match self.lock() {
-            Err(_) => Ok(()),
-            Ok(d) => d.flush(interval),
+            Err(_) => todo!("Posined??"),
+            Ok(d) => d.flush(request),
         }
     }
 }
